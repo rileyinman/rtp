@@ -2,6 +2,7 @@ use crypto;
 use handy_async::sync_io::{ReadExt, WriteExt};
 use num::BigUint;
 use splay_tree::SplaySet;
+use std::borrow::Cow;
 use std::io::Read;
 
 use io::{ReadFrom, WriteTo};
@@ -9,8 +10,6 @@ use rfc3550;
 use traits::{ReadPacket, RtcpPacket, RtpPacket};
 use types::U48;
 use {ErrorKind, Result};
-
-pub type PacketIndex = U48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionAlgorithm {
@@ -34,34 +33,216 @@ impl Default for AuthenticationAlgorithm {
     }
 }
 
+pub trait Protocol: Sized {
+    type PacketIndex: Sized + Ord + Into<u64> + Into<BigUint> + Copy;
+    const ENC_KEY_LABEL: u8;
+    const AUTH_KEY_LABEL: u8;
+    const SALT_KEY_LABEL: u8;
+
+    fn determine_packet_index(context: &Context<Self>, packet: &[u8]) -> Result<Self::PacketIndex>;
+    fn get_authenticated_bytes<'a>(
+        context: &Context<Self>,
+        auth_portion: &'a [u8],
+    ) -> Result<Cow<'a, [u8]>>;
+    fn decrypt(context: &Context<Self>, packet: &[u8], index: Self::PacketIndex)
+        -> Result<Vec<u8>>;
+    fn update_highest_recv_index(context: &mut Context<Self>, index: Self::PacketIndex);
+}
+
+// TODO maybe use type marker to ensure one context is only ever used for either sending OR receiving
 // https://tools.ietf.org/html/rfc3711#section-3.2
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SrtpContext {
-    // TODO: support other fields
+pub struct Context<P: Protocol> {
+    // TODO support re-keying
+    // TODO support mki
     pub master_key: Vec<u8>,
     pub master_salt: Vec<u8>,
     // Since actual kdr is a power of two, this only stores the power (+1).
     // i.e. actual kdr is 2^(key_derivation_rate-1) (or 0 in case of 0)
     pub key_derivation_rate: u8,
-    pub rollover_counter: u32,
-    pub highest_recv_seq_num: u16,
     pub encryption: EncryptionAlgorithm,
     pub authentication: AuthenticationAlgorithm,
-    pub replay_list: SplaySet<PacketIndex>,
+    pub replay_list: SplaySet<P::PacketIndex>,
     pub session_encr_key: Vec<u8>,
     pub session_salt_key: Vec<u8>,
     pub session_auth_key: Vec<u8>,
     pub auth_tag_len: usize,
+    pub protocol_specific: P,
 }
-impl SrtpContext {
-    pub fn new(master_key: &[u8], master_salt: &[u8]) -> Self {
-        // TODO: support MKI
-        SrtpContext {
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Srtp {
+    pub rollover_counter: u32,
+    pub highest_recv_seq_num: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Srtcp {}
+
+impl Context<Srtp> {
+    pub fn new_srtp(master_key: &[u8], master_salt: &[u8]) -> Self {
+        Context::new(
+            master_key,
+            master_salt,
+            Srtp {
+                rollover_counter: 0,
+                highest_recv_seq_num: 0,
+            },
+        )
+    }
+}
+
+impl Context<Srtcp> {
+    pub fn new_srtcp(master_key: &[u8], master_salt: &[u8]) -> Self {
+        Context::new(master_key, master_salt, Srtcp {})
+    }
+}
+
+impl Srtp {
+    fn parse_seq_num(packet: &[u8]) -> Result<u16> {
+        let reader = &mut &packet[..];
+        let header = track_try!(rfc3550::RtpFixedHeader::read_from(reader));
+        Ok(header.seq_num)
+    }
+
+    // Estimate packet index from packet sequence number, highest received
+    // sequence number and current rollover_counter, i.e. determining the most
+    // likely (minimizing index offset) ROC for the given sequence number.
+    // As per https://tools.ietf.org/html/rfc3711#section-3.3.1
+    fn estimate_packet_index(context: &Context<Self>, seq_num: u16) -> U48 {
+        let Srtp {
+            highest_recv_seq_num,
+            rollover_counter,
+        } = context.protocol_specific;
+        let mid_seq_num = 1 << 15;
+        let probable_roc = if highest_recv_seq_num < mid_seq_num {
+            if highest_recv_seq_num + mid_seq_num < seq_num {
+                rollover_counter.wrapping_sub(1)
+            } else {
+                rollover_counter
+            }
+        } else {
+            if highest_recv_seq_num - mid_seq_num > seq_num {
+                rollover_counter.wrapping_add(1)
+            } else {
+                rollover_counter
+            }
+        };
+        (U48::from(probable_roc) << 16) + U48::from(seq_num)
+    }
+}
+
+impl Protocol for Srtp {
+    type PacketIndex = U48;
+    const ENC_KEY_LABEL: u8 = 0;
+    const AUTH_KEY_LABEL: u8 = 1;
+    const SALT_KEY_LABEL: u8 = 2;
+
+    fn determine_packet_index(context: &Context<Self>, packet: &[u8]) -> Result<Self::PacketIndex> {
+        let seq_num = track_try!(Srtp::parse_seq_num(packet));
+        Ok(Srtp::estimate_packet_index(context, seq_num))
+    }
+
+    fn get_authenticated_bytes<'a>(
+        context: &Context<Self>,
+        auth_portion: &'a [u8],
+    ) -> Result<Cow<'a, [u8]>> {
+        // For SRTP, the ROC is part of the authenticated bytes (but not in the actual packet)
+        let roc = context.protocol_specific.rollover_counter;
+        let mut auth_bytes = Vec::from(auth_portion);
+        track_try!((&mut auth_bytes).write_u32be(roc));
+        Ok(Cow::Owned(auth_bytes))
+    }
+
+    fn decrypt(
+        context: &Context<Self>,
+        packet: &[u8],
+        index: Self::PacketIndex,
+    ) -> Result<Vec<u8>> {
+        let reader = &mut &packet[..];
+        let header = track_try!(rfc3550::RtpFixedHeader::read_from(reader));
+        let ssrc = header.ssrc;
+        let encrypted_portion = &reader[0..reader.len() - context.auth_tag_len];
+
+        let mut decrypted: Vec<u8> = Vec::new();
+        track_try!(header.write_to(&mut decrypted));
+        context.decrypt_portion(encrypted_portion, &mut decrypted, ssrc, index);
+        Ok(decrypted)
+    }
+
+    fn update_highest_recv_index(context: &mut Context<Self>, index: Self::PacketIndex) {
+        // https://tools.ietf.org/html/rfc3711#section-3.3.1
+        let state = &mut context.protocol_specific;
+        let rollover_counter = (index >> 16) as u32;
+        let seq_num = index as u16;
+        if rollover_counter == state.rollover_counter {
+            if seq_num > state.highest_recv_seq_num {
+                state.highest_recv_seq_num = seq_num;
+            }
+        } else if rollover_counter > state.rollover_counter {
+            state.highest_recv_seq_num = seq_num;
+            state.rollover_counter = rollover_counter;
+        }
+    }
+}
+
+impl Protocol for Srtcp {
+    type PacketIndex = u32; // actually 31-bits
+    const ENC_KEY_LABEL: u8 = 3;
+    const AUTH_KEY_LABEL: u8 = 4;
+    const SALT_KEY_LABEL: u8 = 5;
+
+    fn determine_packet_index(context: &Context<Self>, packet: &[u8]) -> Result<Self::PacketIndex> {
+        let reader = &mut &packet[packet.len() - context.auth_tag_len - 4..];
+        let index = track_try!(reader.read_u32be());
+        Ok(index & 0x7FFF_FFFF) // remove uppermost bit (aka. E-bit) which isn't part of the index
+    }
+
+    fn get_authenticated_bytes<'a>(
+        _context: &Context<Self>,
+        auth_portion: &'a [u8],
+    ) -> Result<Cow<'a, [u8]>> {
+        // For SRTCP the full packet index is already part of the packet
+        Ok(Cow::Borrowed(auth_portion))
+    }
+
+    fn decrypt(
+        context: &Context<Self>,
+        packet: &[u8],
+        index: Self::PacketIndex,
+    ) -> Result<Vec<u8>> {
+        let e_bit_reader = &mut &packet[packet.len() - context.auth_tag_len - 4..];
+        let is_encrypted = track_try!(e_bit_reader.read_u32be()) & 0x8000_0000 != 0;
+        if !is_encrypted {
+            return Ok(Vec::from(
+                &packet[..packet.len() - context.auth_tag_len - 4],
+            ));
+        }
+
+        let reader = &mut &packet[..];
+        let _ = track_try!(reader.read_u32be());
+        let ssrc = track_try!(reader.read_u32be());
+        let encrypted_portion = &reader[0..reader.len() - context.auth_tag_len - 4];
+
+        let mut decrypted = Vec::from(&packet[..8]);
+        context.decrypt_portion(encrypted_portion, &mut decrypted, ssrc, index);
+        Ok(decrypted)
+    }
+
+    fn update_highest_recv_index(_context: &mut Context<Self>, _index: Self::PacketIndex) {
+        // full packet inex is part of SRTCP packets, no need to keep track of it
+    }
+}
+
+impl<P: Protocol> Context<P>
+where
+    u64: From<P::PacketIndex>,
+{
+    pub fn new(master_key: &[u8], master_salt: &[u8], protocol_specific: P) -> Self {
+        Context {
             master_key: Vec::from(master_key),
             master_salt: Vec::from(master_salt),
             key_derivation_rate: 0,
-            rollover_counter: 0,
-            highest_recv_seq_num: 0,
             encryption: EncryptionAlgorithm::default(),
             authentication: AuthenticationAlgorithm::default(),
             replay_list: SplaySet::new(),
@@ -69,13 +250,14 @@ impl SrtpContext {
             session_salt_key: vec![0; 112 / 8],
             session_auth_key: vec![0; 160 / 8],
             auth_tag_len: 80 / 8,
+            protocol_specific,
         }
     }
-    pub fn update_session_keys(&mut self, index: u64) {
+    pub fn update_session_keys(&mut self, index: P::PacketIndex) {
         let index = if self.key_derivation_rate == 0 {
             0
         } else {
-            index >> (self.key_derivation_rate - 1)
+            u64::from(index) >> (self.key_derivation_rate - 1)
         };
 
         // TODO: only recalculate if index changed, probably also cache surrounding indices
@@ -83,9 +265,12 @@ impl SrtpContext {
 
         let index = BigUint::from(index);
 
-        let enc_key_id = BigUint::from_bytes_be(&[0, 0, 0, 0, 0, 0, 0]) + index.clone();
-        let auth_key_id = BigUint::from_bytes_be(&[1, 0, 0, 0, 0, 0, 0]) + index.clone();
-        let salt_key_id = BigUint::from_bytes_be(&[2, 0, 0, 0, 0, 0, 0]) + index.clone();
+        let enc_key_id =
+            BigUint::from_bytes_be(&[P::ENC_KEY_LABEL, 0, 0, 0, 0, 0, 0]) + index.clone();
+        let auth_key_id =
+            BigUint::from_bytes_be(&[P::AUTH_KEY_LABEL, 0, 0, 0, 0, 0, 0]) + index.clone();
+        let salt_key_id =
+            BigUint::from_bytes_be(&[P::SALT_KEY_LABEL, 0, 0, 0, 0, 0, 0]) + index.clone();
         let master_salt = BigUint::from_bytes_be(&self.master_salt);
 
         self.session_encr_key = prf_n(
@@ -108,212 +293,37 @@ impl SrtpContext {
         let auth_portion = &packet[..packet.len() - self.auth_tag_len];
         let auth_tag = &packet[packet.len() - self.auth_tag_len..];
 
-        let mut auth_bytes = Vec::from(auth_portion);
-        track_try!((&mut auth_bytes).write_u32be(self.rollover_counter));
+        let auth_bytes = track_try!(P::get_authenticated_bytes(self, auth_portion));
 
         let mut expected_tag = hmac_hash_sha1(&self.session_auth_key, &auth_bytes);
         expected_tag.truncate(self.auth_tag_len);
         track_assert_eq!(auth_tag, &expected_tag[..], ErrorKind::Invalid);
         Ok(())
     }
-    pub fn decrypt(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        let reader = &mut &packet[..];
-        let header = track_try!(rfc3550::RtpFixedHeader::read_from(reader));
-        let encrypted_portion = &reader[0..reader.len() - self.auth_tag_len];
-
-        let index = ((self.rollover_counter as u64) << 32) + (header.seq_num as u64);
-        let iv = BigUint::from_bytes_be(&self.session_salt_key) << 16;
-        let iv = iv ^ (BigUint::from(header.ssrc) << 64);
-        let iv = iv ^ (BigUint::from(index) << 16);
-        let iv = &iv.to_bytes_be()[0..self.session_encr_key.len()];
-
-        let mut ctr =
-            crypto::aes::ctr(crypto::aes::KeySize::KeySize128, &self.session_encr_key, iv);
-        let block_size = self.session_encr_key.len();
-
-        let mut decrypted: Vec<u8> = Vec::new();
-        track_try!(header.write_to(&mut decrypted));
-
-        for block in encrypted_portion.chunks(block_size) {
-            let old_len = decrypted.len();
-            decrypted.resize(old_len + block.len(), 0);
-            ctr.process(block, &mut decrypted[old_len..]);
-        }
-
-        Ok(decrypted)
-    }
-
-    // Estimate packet index from packet sequence number, heighest received
-    // sequence number and current rollover_counter, i.e. determining the most
-    // likely (minimizing index offset) ROC for the given sequence number.
-    // As per https://tools.ietf.org/html/rfc3711#section-3.3.1
-    // Returns (most likely ROC, index)
-    pub fn estimate_packet_index(&self, seq_num: u16) -> (u32, PacketIndex) {
-        let mid_seq_num = 1 << 15;
-        let highest_seq_num = self.highest_recv_seq_num;
-        let probable_roc = if highest_seq_num < mid_seq_num {
-            if highest_seq_num + mid_seq_num < seq_num {
-                self.rollover_counter.wrapping_sub(1)
-            } else {
-                self.rollover_counter
-            }
-        } else {
-            if highest_seq_num - mid_seq_num > seq_num {
-                self.rollover_counter.wrapping_add(1)
-            } else {
-                self.rollover_counter
-            }
-        };
-        (probable_roc, ((probable_roc as PacketIndex) << 16) + seq_num as PacketIndex)
-    }
-
-    // https://tools.ietf.org/html/rfc3711#section-3.3
-    pub fn process_incoming(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        // Step 1: determining the correct context (has already happened at this point)
-
-        // Step 2: Determine index of the SRTP packet
-        let reader = &mut &packet[..];
-        let header = track_try!(rfc3550::RtpFixedHeader::read_from(reader));
-        let seq_num = header.seq_num;
-        let (rollover_counter, index) = self.estimate_packet_index(seq_num);
-
-        // Step 3: Determine master key and salt
-        // TODO: support re-keying
-        // TODO: support MKI
-
-        // Step 4: Determine session keys and salt
-        self.update_session_keys(index);
-
-        // Step 5: Replay protection and authentication
-        // TODO: replay protection
-        self.authenticate(packet)?;
-
-        // Step 6: Decryption
-        let result = self.decrypt(packet)?;
-
-        // Step 7: Update ROC, highest sequence number and replay protection
-        // TODO: replay protection
-        // https://tools.ietf.org/html/rfc3711#section-3.3.1
-        if rollover_counter == self.rollover_counter {
-            if seq_num > self.highest_recv_seq_num {
-                self.highest_recv_seq_num = seq_num;
-            }
-        } else if rollover_counter > self.rollover_counter {
-            self.highest_recv_seq_num = seq_num;
-            self.rollover_counter = rollover_counter;
-        }
-
-        Ok(result)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SrtcpContext {
-    // TODO: support other fields
-    pub master_key: Vec<u8>,
-    pub master_salt: Vec<u8>,
-    // Since actual kdr is a power of two, this only stores the power (+1).
-    // i.e. actual kdr is 2^(key_derivation_rate-1) (or 0 in case of 0)
-    pub key_derivation_rate: u8,
-    pub highest_recv_index: u32, // NOTE: 31-bits
-    pub encryption: EncryptionAlgorithm,
-    pub authentication: AuthenticationAlgorithm,
-    pub replay_list: SplaySet<u32>,
-    pub session_encr_key: Vec<u8>,
-    pub session_salt_key: Vec<u8>,
-    pub session_auth_key: Vec<u8>,
-    pub auth_tag_len: usize,
-}
-impl SrtcpContext {
-    pub fn new(master_key: &[u8], master_salt: &[u8]) -> Self {
-        // TODO: support MKI
-        SrtcpContext {
-            master_key: Vec::from(master_key),
-            master_salt: Vec::from(master_salt),
-            key_derivation_rate: 0,
-            highest_recv_index: 0,
-            encryption: EncryptionAlgorithm::default(),
-            authentication: AuthenticationAlgorithm::default(),
-            replay_list: SplaySet::new(),
-            session_encr_key: vec![0; 128 / 8],
-            session_salt_key: vec![0; 112 / 8],
-            session_auth_key: vec![0; 160 / 8],
-            auth_tag_len: 80 / 8,
-        }
-    }
-    pub fn update_session_keys(&mut self, index: u32) {
-        let index = if self.key_derivation_rate == 0 {
-            0
-        } else {
-            index >> (self.key_derivation_rate - 1)
-        };
-
-        // TODO: only recalculate if index changed, probably also cache surrounding indices
-        //       but make sure the initial updates happens
-
-        // See: https://tools.ietf.org/html/rfc3711#section-4.3.2
-        let index = BigUint::from(index);
-
-        let enc_key_id = BigUint::from_bytes_be(&[3, 0, 0, 0, 0, 0, 0]) + index.clone();
-        let auth_key_id = BigUint::from_bytes_be(&[4, 0, 0, 0, 0, 0, 0]) + index.clone();
-        let salt_key_id = BigUint::from_bytes_be(&[5, 0, 0, 0, 0, 0, 0]) + index.clone();
-        let master_salt = BigUint::from_bytes_be(&self.master_salt);
-
-        self.session_encr_key = prf_n(
-            &self.master_key,
-            enc_key_id ^ master_salt.clone(),
-            self.session_encr_key.len(),
-        );
-        self.session_auth_key = prf_n(
-            &self.master_key,
-            auth_key_id ^ master_salt.clone(),
-            self.session_auth_key.len(),
-        );
-        self.session_salt_key = prf_n(
-            &self.master_key,
-            salt_key_id ^ master_salt.clone(),
-            self.session_salt_key.len(),
-        );
-    }
-    pub fn authenticate(&self, packet: &[u8]) -> Result<()> {
-        let auth_portion = &packet[..packet.len() - self.auth_tag_len];
-        let auth_tag = &packet[packet.len() - self.auth_tag_len..];
-
-        let mut expected_tag = hmac_hash_sha1(&self.session_auth_key, &auth_portion);
-        expected_tag.truncate(self.auth_tag_len);
-        track_assert_eq!(auth_tag, &expected_tag[..], ErrorKind::Invalid);
-        Ok(())
-    }
-    pub fn decrypt(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        let index = track_try!((&mut &packet[packet.len() - self.auth_tag_len - 4..]).read_u32be());
-        let is_encrypted = index & 0x8000_0000 != 0;
-        if !is_encrypted {
-            return Ok(Vec::from(&packet[..packet.len() - self.auth_tag_len - 4]));
-        }
-        let index = index & 0x7FFF_FFFF;
-
-        let reader = &mut &packet[..];
-        let _ = track_try!(reader.read_u32be());
-        let ssrc = track_try!(reader.read_u32be());
-        let encrypted_portion = &reader[0..reader.len() - self.auth_tag_len - 4];
-
+    pub fn decrypt_portion(
+        &self,
+        encrypted: &[u8],
+        decrypted: &mut Vec<u8>,
+        ssrc: u32,
+        index: P::PacketIndex,
+    ) {
         let iv = BigUint::from_bytes_be(&self.session_salt_key) << 16;
         let iv = iv ^ (BigUint::from(ssrc) << 64);
-        let iv = iv ^ (BigUint::from(index) << 16);
+        let iv = iv ^ (index.into() << 16);
         let iv = &iv.to_bytes_be()[0..self.session_encr_key.len()];
 
         let mut ctr =
             crypto::aes::ctr(crypto::aes::KeySize::KeySize128, &self.session_encr_key, iv);
         let block_size = self.session_encr_key.len();
 
-        let mut decrypted = Vec::from(&packet[..8]);
-        for block in encrypted_portion.chunks(block_size) {
+        for block in encrypted.chunks(block_size) {
             let old_len = decrypted.len();
             decrypted.resize(old_len + block.len(), 0);
             ctr.process(block, &mut decrypted[old_len..]);
         }
-
-        Ok(decrypted)
+    }
+    pub fn decrypt(&mut self, packet: &[u8], index: P::PacketIndex) -> Result<Vec<u8>> {
+        P::decrypt(self, packet, index)
     }
 
     // https://tools.ietf.org/html/rfc3711#section-3.3
@@ -321,9 +331,8 @@ impl SrtcpContext {
     pub fn process_incoming(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         // Step 1: determining the correct context (has already happened at this point)
 
-        // Step 2: Determine index of the SRTCP packet
-        let index = track_try!((&mut &packet[packet.len() - self.auth_tag_len - 4..]).read_u32be());
-        let index = index & 0x7FFF_FFFF; // remove uppermost bit which isn't part of the index
+        // Step 2: Determine index of the packet
+        let index = track_try!(P::determine_packet_index(self, packet));
 
         // Step 3: Determine master key and salt
         // TODO: support re-keying
@@ -337,10 +346,11 @@ impl SrtcpContext {
         track_try!(self.authenticate(packet));
 
         // Step 6: Decryption
-        let result = track_try!(self.decrypt(packet));
+        let result = track_try!(self.decrypt(packet, index));
 
-        // Step 7: Update replay protection
+        // Step 7: Update ROC, highest sequence number and replay protection
         // TODO: replay protection
+        P::update_highest_recv_index(self, index);
 
         Ok(result)
     }
@@ -348,7 +358,7 @@ impl SrtcpContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrtpPacketReader<T> {
-    context: SrtpContext,
+    context: Context<Srtp>,
     inner: T,
 }
 impl<T> SrtpPacketReader<T>
@@ -356,7 +366,7 @@ where
     T: ReadPacket,
     T::Packet: RtpPacket,
 {
-    pub fn new(mut context: SrtpContext, inner: T) -> Self {
+    pub fn new(context: Context<Srtp>, inner: T) -> Self {
         SrtpPacketReader {
             context: context,
             inner: inner,
@@ -382,7 +392,7 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrtcpPacketReader<T> {
-    context: SrtcpContext,
+    context: Context<Srtcp>,
     inner: T,
 }
 impl<T> SrtcpPacketReader<T>
@@ -390,7 +400,7 @@ where
     T: ReadPacket,
     T::Packet: RtcpPacket,
 {
-    pub fn new(mut context: SrtcpContext, inner: T) -> Self {
+    pub fn new(context: Context<Srtcp>, inner: T) -> Self {
         SrtcpPacketReader {
             context: context,
             inner: inner,
@@ -452,23 +462,24 @@ mod test {
     use rfc4585;
 
     #[test]
-    fn packet_index_estimation_works() {
-        let mut context = SrtpContext::new(&[], &[]);
+    fn rtp_packet_index_estimation_works() {
+        let mut context = Context::new_srtp(&[], &[]);
         let roc = 0u32;
         let roc_n1 = roc.wrapping_sub(1);
         let roc_p1 = roc.wrapping_add(1);
-        context.rollover_counter = roc;
+        context.protocol_specific.rollover_counter = roc;
 
-        let i = |roc, seq_num| (roc, ((roc as u64) << 16) + seq_num as u64);
+        let i = |roc, seq_num| ((roc as u64) << 16) + seq_num as u64;
+        let estimate = |ctx: &Context<Srtp>, seq_num| Srtp::estimate_packet_index(ctx, seq_num);
 
-        context.highest_recv_seq_num = 1000; // low highest_seq_num
-        assert_eq!(context.estimate_packet_index(1), i(roc, 1)); // lower but same roc
-        assert_eq!(context.estimate_packet_index(10001), i(roc, 10001)); // heigher but same roc
-        assert_eq!(context.estimate_packet_index(60001), i(roc_n1, 60001)); // roc-1
-        context.highest_recv_seq_num = 60000; // heigh highest_seq_num
-        assert_eq!(context.estimate_packet_index(60001), i(roc, 60001)); // heigher but same roc
-        assert_eq!(context.estimate_packet_index(30001), i(roc, 30001)); // lower but same roc
-        assert_eq!(context.estimate_packet_index(10001), i(roc_p1, 10001)); // roc+1
+        context.protocol_specific.highest_recv_seq_num = 1000; // low highest_seq_num
+        assert_eq!(estimate(&context, 1), i(roc, 1)); // lower but same roc
+        assert_eq!(estimate(&context, 10001), i(roc, 10001)); // higher but same roc
+        assert_eq!(estimate(&context, 60001), i(roc_n1, 60001)); // roc-1
+        context.protocol_specific.highest_recv_seq_num = 60000; // high highest_seq_num
+        assert_eq!(estimate(&context, 60001), i(roc, 60001)); // higher but same roc
+        assert_eq!(estimate(&context, 30001), i(roc, 30001)); // lower but same roc
+        assert_eq!(estimate(&context, 10001), i(roc_p1, 10001)); // roc+1
     }
 
     #[test]
@@ -494,7 +505,7 @@ mod test {
             145, 206,
         ];
 
-        let context = SrtpContext::new(&master_key, &master_salt);
+        let context = Context::new_srtp(&master_key, &master_salt);
         let mut rtp_reader = SrtpPacketReader::new(context, rfc3550::RtpPacketReader);
         let packet = rtp_reader.read_packet(&mut &packet[..]).unwrap();
 
@@ -526,7 +537,7 @@ mod test {
             236, 161, 194, 6, 232, 194, 230,
         ];
 
-        let context = SrtcpContext::new(&master_key, &master_salt);
+        let context = Context::new_srtcp(&master_key, &master_salt);
         let mut rtcp_reader = SrtcpPacketReader::new(context, rfc4585::RtcpPacketReader);
         let packet = track_try_unwrap!(rtcp_reader.read_packet(&mut &packet[..]));
         println!("# {:?}", packet);

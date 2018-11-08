@@ -11,7 +11,7 @@ use fibers::net::UdpSocket;
 use fibers::{Executor, InPlaceExecutor, Spawn};
 use futures::{Async, Future, Poll};
 use rtp::rfc3550::RtpPacketReader;
-use rtp::rfc3711::{SrtpContext, SrtpPacketReader};
+use rtp::rfc3711::{Context, Srtp, SrtpPacketReader};
 use rtp::traits::ReadPacket;
 use rtp::{Error, ErrorKind};
 use trackable::error::ErrorKindExt;
@@ -39,7 +39,7 @@ fn main() {
 
     let master_key = hex_str_to_bytes(matches.value_of("MASTER_KEY").unwrap());
     let master_salt = hex_str_to_bytes(matches.value_of("MASTER_SALT").unwrap());
-    let context = SrtpContext::new(&master_key, &master_salt);
+    let context = Context::new_srtp(&master_key, &master_salt);
     let future = track_err!(UdpSocket::bind(addr))
         .and_then(move |socket| SrtpRecvLoop::new(socket, context));
 
@@ -67,7 +67,7 @@ struct SrtpRecvLoop {
     reader: SrtpPacketReader<RtpPacketReader>,
 }
 impl SrtpRecvLoop {
-    fn new(socket: UdpSocket, context: SrtpContext) -> Self {
+    fn new(socket: UdpSocket, context: Context<Srtp>) -> Self {
         let inner = RtpPacketReader;
         SrtpRecvLoop {
             future: socket.recv_from(vec![0; 4096]),

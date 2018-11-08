@@ -161,10 +161,10 @@ pub struct SrtcpContext {
     // TODO: support other fields
     pub master_key: Vec<u8>,
     pub master_salt: Vec<u8>,
-    pub highest_recv_index: PacketIndex, // NOTE: 47-bits
+    pub highest_recv_index: u32, // NOTE: 31-bits
     pub encryption: EncryptionAlgorithm,
     pub authentication: AuthenticationAlgorithm,
-    pub replay_list: SplaySet<PacketIndex>,
+    pub replay_list: SplaySet<u32>,
     pub session_encr_key: Vec<u8>,
     pub session_salt_key: Vec<u8>,
     pub session_auth_key: Vec<u8>,

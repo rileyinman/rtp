@@ -130,6 +130,30 @@ impl SrtpContext {
 
         Ok(decrypted)
     }
+
+    // Estimate packet index from packet sequence number, heighest received
+    // sequence number and current rollover_counter, i.e. determining the most
+    // likely (minimizing index offset) ROC for the given sequence number.
+    // As per https://tools.ietf.org/html/rfc3711#section-3.3.1
+    // Returns (most likely ROC, index)
+    pub fn estimate_packet_index(&self, seq_num: u16) -> (u32, PacketIndex) {
+        let mid_seq_num = 1 << 15;
+        let highest_seq_num = self.highest_recv_seq_num;
+        let probable_roc = if highest_seq_num < mid_seq_num {
+            if highest_seq_num + mid_seq_num < seq_num {
+                self.rollover_counter.wrapping_sub(1)
+            } else {
+                self.rollover_counter
+            }
+        } else {
+            if highest_seq_num - mid_seq_num > seq_num {
+                self.rollover_counter.wrapping_add(1)
+            } else {
+                self.rollover_counter
+            }
+        };
+        (probable_roc, ((probable_roc as PacketIndex) << 16) + seq_num as PacketIndex)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +361,26 @@ mod test {
     use super::*;
     use rfc3550;
     use rfc4585;
+
+    #[test]
+    fn packet_index_estimation_works() {
+        let mut context = SrtpContext::new(&[], &[]);
+        let roc = 0u32;
+        let roc_n1 = roc.wrapping_sub(1);
+        let roc_p1 = roc.wrapping_add(1);
+        context.rollover_counter = roc;
+
+        let i = |roc, seq_num| (roc, ((roc as u64) << 16) + seq_num as u64);
+
+        context.highest_recv_seq_num = 1000; // low highest_seq_num
+        assert_eq!(context.estimate_packet_index(1), i(roc, 1)); // lower but same roc
+        assert_eq!(context.estimate_packet_index(10001), i(roc, 10001)); // heigher but same roc
+        assert_eq!(context.estimate_packet_index(60001), i(roc_n1, 60001)); // roc-1
+        context.highest_recv_seq_num = 60000; // heigh highest_seq_num
+        assert_eq!(context.estimate_packet_index(60001), i(roc, 60001)); // heigher but same roc
+        assert_eq!(context.estimate_packet_index(30001), i(roc, 30001)); // lower but same roc
+        assert_eq!(context.estimate_packet_index(10001), i(roc_p1, 10001)); // roc+1
+    }
 
     #[test]
     fn rtp_decryption_works() {

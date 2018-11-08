@@ -24,6 +24,16 @@ impl Default for EncryptionAlgorithm {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationAlgorithm {
+    HmacSha1,
+}
+impl Default for AuthenticationAlgorithm {
+    fn default() -> Self {
+        AuthenticationAlgorithm::HmacSha1
+    }
+}
+
 // https://tools.ietf.org/html/rfc3711#section-3.2
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrtpContext {
@@ -33,6 +43,7 @@ pub struct SrtpContext {
     pub rollover_counter: u32,
     pub highest_recv_seq_num: u16,
     pub encryption: EncryptionAlgorithm,
+    pub authentication: AuthenticationAlgorithm,
     pub replay_list: SplaySet<PacketIndex>,
     pub session_encr_key: Vec<u8>,
     pub session_salt_key: Vec<u8>,
@@ -48,6 +59,7 @@ impl SrtpContext {
             rollover_counter: 0,
             highest_recv_seq_num: 0,
             encryption: EncryptionAlgorithm::default(),
+            authentication: AuthenticationAlgorithm::default(),
             replay_list: SplaySet::new(),
             session_encr_key: vec![0; 128 / 8],
             session_salt_key: vec![0; 112 / 8],
@@ -127,6 +139,7 @@ pub struct SrtcpContext {
     pub master_salt: Vec<u8>,
     pub highest_recv_index: PacketIndex, // NOTE: 47-bits
     pub encryption: EncryptionAlgorithm,
+    pub authentication: AuthenticationAlgorithm,
     pub replay_list: SplaySet<PacketIndex>,
     pub session_encr_key: Vec<u8>,
     pub session_salt_key: Vec<u8>,
@@ -141,6 +154,7 @@ impl SrtcpContext {
             master_salt: Vec::from(master_salt),
             highest_recv_index: 0,
             encryption: EncryptionAlgorithm::default(),
+            authentication: AuthenticationAlgorithm::default(),
             replay_list: SplaySet::new(),
             session_encr_key: vec![0; 128 / 8],
             session_salt_key: vec![0; 112 / 8],

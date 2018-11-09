@@ -3,7 +3,7 @@ extern crate trackable;
 extern crate crypto;
 extern crate handy_async;
 extern crate num;
-extern crate splay_tree;
+extern crate fixedbitset;
 
 pub use error::{Error, ErrorKind};
 

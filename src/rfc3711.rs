@@ -1,7 +1,7 @@
 use crypto;
+use fixedbitset::FixedBitSet;
 use handy_async::sync_io::{ReadExt, WriteExt};
 use num::BigUint;
-use splay_tree::SplaySet;
 use std::borrow::Cow;
 use std::io::{Read, Write};
 
@@ -72,7 +72,8 @@ pub struct Context<P: Protocol> {
     pub key_derivation_rate: u8,
     pub encryption: EncryptionAlgorithm,
     pub authentication: AuthenticationAlgorithm,
-    pub replay_list: SplaySet<P::PacketIndex>,
+    pub replay_window_head: u64,
+    pub replay_window: FixedBitSet,
     pub session_encr_key: Vec<u8>,
     pub session_salt_key: Vec<u8>,
     pub session_auth_key: Vec<u8>,
@@ -329,7 +330,8 @@ where
             key_derivation_rate: 0,
             encryption: EncryptionAlgorithm::default(),
             authentication: AuthenticationAlgorithm::default(),
-            replay_list: SplaySet::new(),
+            replay_window_head: 0,
+            replay_window: FixedBitSet::with_capacity(128),
             session_encr_key: vec![0; 128 / 8],
             session_salt_key: vec![0; 112 / 8],
             session_auth_key: vec![0; 160 / 8],
@@ -461,14 +463,40 @@ where
         self.update_session_keys(index);
 
         // Step 5: Replay protection and authentication
-        // TODO: replay protection
+        let idx = u64::from(index);
+        let window_size = self.replay_window.len() as u64;
+        if idx <= self.replay_window_head {
+            track_assert!(
+                idx + window_size > self.replay_window_head,
+                ErrorKind::Invalid
+            );
+            track_assert!(
+                !self.replay_window[(idx % window_size) as usize],
+                ErrorKind::Invalid
+            );
+        }
         track_try!(self.authenticate(packet));
 
         // Step 6: Decryption
         let result = track_try!(self.decrypt(packet, index));
 
         // Step 7: Update ROC, highest sequence number and replay protection
-        // TODO: replay protection
+        if idx > self.replay_window_head {
+            if idx - self.replay_window_head >= window_size {
+                self.replay_window.clear()
+            } else {
+                let start = ((self.replay_window_head + 1) % window_size) as usize;
+                let end = (idx % window_size) as usize;
+                if start > end {
+                    self.replay_window.set_range(start.., false);
+                    self.replay_window.set_range(..end, false);
+                } else {
+                    self.replay_window.set_range(start..end, false);
+                }
+            }
+            self.replay_window_head = idx;
+        }
+        self.replay_window.insert((idx % window_size) as usize);
         P::update_highest_recv_index(self, index);
 
         Ok(result)
@@ -789,5 +817,65 @@ mod test {
         assert_ne!(encrypted_1, encrypted_2);
         assert_ne!(encrypted_1, encrypted_3);
         assert_ne!(encrypted_2, encrypted_3);
+    }
+
+    #[test]
+    fn rtp_does_not_allow_packet_replay() {
+        let mut dec_context = Context::new_srtp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        assert!(dec_context.process_incoming(TEST_SRTP_PACKET).is_ok());
+        assert!(dec_context.process_incoming(TEST_SRTP_PACKET).is_err());
+        assert!(dec_context.process_incoming(TEST_SRTP_PACKET).is_err());
+    }
+
+    #[test]
+    fn rtcp_does_not_allow_packet_replay() {
+        let mut dec_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        assert!(dec_context.process_incoming(TEST_SRTCP_PACKET).is_ok());
+        assert!(dec_context.process_incoming(TEST_SRTCP_PACKET).is_err());
+        assert!(dec_context.process_incoming(TEST_SRTCP_PACKET).is_err());
+    }
+
+    #[test]
+    fn rtcp_does_not_allow_delayed_packet_replay() {
+        let mut dec_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        let decrypted = dec_context.process_incoming(TEST_SRTCP_PACKET).unwrap();
+
+        let mut enc_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        const N: usize = 10;
+        let encs: Vec<_> = (0..N)
+            .map(|_| enc_context.process_outgoing(&decrypted).unwrap())
+            .collect();
+
+        let mut dec_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        dec_context.replay_window = FixedBitSet::with_capacity(4);
+
+        assert!(dec_context.process_incoming(&encs[0]).is_ok());
+        assert!(dec_context.process_incoming(&encs[1]).is_ok());
+        assert!(dec_context.process_incoming(&encs[2]).is_ok());
+        assert!(dec_context.process_incoming(&encs[3]).is_ok());
+        assert!(dec_context.process_incoming(&encs[4]).is_ok());
+        assert!(dec_context.process_incoming(&encs[5]).is_ok());
+        assert!(dec_context.process_incoming(&encs[0]).is_err());
+        assert!(dec_context.process_incoming(&encs[1]).is_err());
+        assert!(dec_context.process_incoming(&encs[2]).is_err());
+        assert!(dec_context.process_incoming(&encs[3]).is_err());
+        assert!(dec_context.process_incoming(&encs[4]).is_err());
+        assert!(dec_context.process_incoming(&encs[5]).is_err());
+
+        assert!(dec_context.process_incoming(&encs[7]).is_ok());
+        assert!(dec_context.process_incoming(&encs[6]).is_ok());
+        assert!(dec_context.process_incoming(&encs[3]).is_err());
+        assert!(dec_context.process_incoming(&encs[4]).is_err());
+        assert!(dec_context.process_incoming(&encs[5]).is_err());
+        assert!(dec_context.process_incoming(&encs[6]).is_err());
+        assert!(dec_context.process_incoming(&encs[7]).is_err());
+
+        assert!(dec_context.process_incoming(&encs[9]).is_ok());
+        assert!(dec_context.process_incoming(&encs[8]).is_ok());
+        assert!(dec_context.process_incoming(&encs[5]).is_err());
+        assert!(dec_context.process_incoming(&encs[6]).is_err());
+        assert!(dec_context.process_incoming(&encs[7]).is_err());
+        assert!(dec_context.process_incoming(&encs[8]).is_err());
+        assert!(dec_context.process_incoming(&encs[9]).is_err());
     }
 }

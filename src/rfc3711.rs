@@ -3,11 +3,11 @@ use handy_async::sync_io::{ReadExt, WriteExt};
 use num::BigUint;
 use splay_tree::SplaySet;
 use std::borrow::Cow;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use io::{ReadFrom, WriteTo};
 use rfc3550;
-use traits::{ReadPacket, RtcpPacket, RtpPacket};
+use traits::{ReadPacket, RtcpPacket, RtpPacket, WritePacket};
 use types::U48;
 use {ErrorKind, Result};
 
@@ -39,14 +39,24 @@ pub trait Protocol: Sized {
     const AUTH_KEY_LABEL: u8;
     const SALT_KEY_LABEL: u8;
 
-    fn determine_packet_index(context: &Context<Self>, packet: &[u8]) -> Result<Self::PacketIndex>;
+    fn determine_incoming_packet_index(
+        context: &Context<Self>,
+        packet: &[u8],
+    ) -> Result<Self::PacketIndex>;
+    fn determine_outgoing_packet_index(
+        context: &Context<Self>,
+        packet: &[u8],
+    ) -> Result<Self::PacketIndex>;
     fn get_authenticated_bytes<'a>(
         context: &Context<Self>,
         auth_portion: &'a [u8],
     ) -> Result<Cow<'a, [u8]>>;
     fn decrypt(context: &Context<Self>, packet: &[u8], index: Self::PacketIndex)
         -> Result<Vec<u8>>;
+    fn encrypt(context: &Context<Self>, packet: &[u8], index: Self::PacketIndex)
+        -> Result<Vec<u8>>;
     fn update_highest_recv_index(context: &mut Context<Self>, index: Self::PacketIndex);
+    fn update_highest_sent_index(context: &mut Context<Self>, index: Self::PacketIndex);
 }
 
 // TODO maybe use type marker to ensure one context is only ever used for either sending OR receiving
@@ -73,11 +83,13 @@ pub struct Context<P: Protocol> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Srtp {
     pub rollover_counter: u32,
-    pub highest_recv_seq_num: u16,
+    pub highest_seq_num: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Srtcp {}
+pub struct Srtcp {
+    pub highest_sent_index: u32, // actually only 31-bits
+}
 
 impl Context<Srtp> {
     pub fn new_srtp(master_key: &[u8], master_salt: &[u8]) -> Self {
@@ -86,7 +98,7 @@ impl Context<Srtp> {
             master_salt,
             Srtp {
                 rollover_counter: 0,
-                highest_recv_seq_num: 0,
+                highest_seq_num: 0,
             },
         )
     }
@@ -94,7 +106,13 @@ impl Context<Srtp> {
 
 impl Context<Srtcp> {
     pub fn new_srtcp(master_key: &[u8], master_salt: &[u8]) -> Self {
-        Context::new(master_key, master_salt, Srtcp {})
+        Context::new(
+            master_key,
+            master_salt,
+            Srtcp {
+                highest_sent_index: 0,
+            },
+        )
     }
 }
 
@@ -111,18 +129,18 @@ impl Srtp {
     // As per https://tools.ietf.org/html/rfc3711#section-3.3.1
     fn estimate_packet_index(context: &Context<Self>, seq_num: u16) -> U48 {
         let Srtp {
-            highest_recv_seq_num,
+            highest_seq_num,
             rollover_counter,
         } = context.protocol_specific;
         let mid_seq_num = 1 << 15;
-        let probable_roc = if highest_recv_seq_num < mid_seq_num {
-            if highest_recv_seq_num + mid_seq_num < seq_num {
+        let probable_roc = if highest_seq_num < mid_seq_num {
+            if highest_seq_num + mid_seq_num < seq_num {
                 rollover_counter.wrapping_sub(1)
             } else {
                 rollover_counter
             }
         } else {
-            if highest_recv_seq_num - mid_seq_num > seq_num {
+            if highest_seq_num - mid_seq_num > seq_num {
                 rollover_counter.wrapping_add(1)
             } else {
                 rollover_counter
@@ -138,7 +156,18 @@ impl Protocol for Srtp {
     const AUTH_KEY_LABEL: u8 = 1;
     const SALT_KEY_LABEL: u8 = 2;
 
-    fn determine_packet_index(context: &Context<Self>, packet: &[u8]) -> Result<Self::PacketIndex> {
+    fn determine_incoming_packet_index(
+        context: &Context<Self>,
+        packet: &[u8],
+    ) -> Result<Self::PacketIndex> {
+        let seq_num = track_try!(Srtp::parse_seq_num(packet));
+        Ok(Srtp::estimate_packet_index(context, seq_num))
+    }
+
+    fn determine_outgoing_packet_index(
+        context: &Context<Self>,
+        packet: &[u8],
+    ) -> Result<Self::PacketIndex> {
         let seq_num = track_try!(Srtp::parse_seq_num(packet));
         Ok(Srtp::estimate_packet_index(context, seq_num))
     }
@@ -170,19 +199,41 @@ impl Protocol for Srtp {
         Ok(decrypted)
     }
 
+    fn encrypt(
+        context: &Context<Self>,
+        packet: &[u8],
+        index: Self::PacketIndex,
+    ) -> Result<Vec<u8>> {
+        let reader = &mut &packet[..];
+        let header = track_try!(rfc3550::RtpFixedHeader::read_from(reader));
+        let ssrc = header.ssrc;
+        let plaintext_portion = &reader[0..];
+
+        let mut encrypted: Vec<u8> = Vec::new();
+        track_try!(header.write_to(&mut encrypted));
+        context.encrypt_portion(plaintext_portion, &mut encrypted, ssrc, index);
+        Ok(encrypted)
+    }
+
     fn update_highest_recv_index(context: &mut Context<Self>, index: Self::PacketIndex) {
         // https://tools.ietf.org/html/rfc3711#section-3.3.1
         let state = &mut context.protocol_specific;
         let rollover_counter = (index >> 16) as u32;
         let seq_num = index as u16;
         if rollover_counter == state.rollover_counter {
-            if seq_num > state.highest_recv_seq_num {
-                state.highest_recv_seq_num = seq_num;
+            if seq_num > state.highest_seq_num {
+                state.highest_seq_num = seq_num;
             }
         } else if rollover_counter > state.rollover_counter {
-            state.highest_recv_seq_num = seq_num;
+            state.highest_seq_num = seq_num;
             state.rollover_counter = rollover_counter;
         }
+    }
+
+    fn update_highest_sent_index(context: &mut Context<Self>, index: Self::PacketIndex) {
+        // Unless we assume that packets are properly ordered when sent,
+        // we have to use the same algorithm to update the ROC as when receiving them.
+        Self::update_highest_recv_index(context, index);
     }
 }
 
@@ -192,10 +243,21 @@ impl Protocol for Srtcp {
     const AUTH_KEY_LABEL: u8 = 4;
     const SALT_KEY_LABEL: u8 = 5;
 
-    fn determine_packet_index(context: &Context<Self>, packet: &[u8]) -> Result<Self::PacketIndex> {
+    fn determine_incoming_packet_index(
+        context: &Context<Self>,
+        packet: &[u8],
+    ) -> Result<Self::PacketIndex> {
         let reader = &mut &packet[packet.len() - context.auth_tag_len - 4..];
         let index = track_try!(reader.read_u32be());
         Ok(index & 0x7FFF_FFFF) // remove uppermost bit (aka. E-bit) which isn't part of the index
+    }
+
+    fn determine_outgoing_packet_index(
+        context: &Context<Self>,
+        _packet: &[u8],
+    ) -> Result<Self::PacketIndex> {
+        const MODULO: u32 = 1 << 31;
+        Ok((context.protocol_specific.highest_sent_index + 1) % MODULO)
     }
 
     fn get_authenticated_bytes<'a>(
@@ -229,8 +291,30 @@ impl Protocol for Srtcp {
         Ok(decrypted)
     }
 
+    fn encrypt(
+        context: &Context<Self>,
+        packet: &[u8],
+        index: Self::PacketIndex,
+    ) -> Result<Vec<u8>> {
+        let reader = &mut &packet[..];
+        let _ = track_try!(reader.read_u32be());
+        let ssrc = track_try!(reader.read_u32be());
+        let plaintext_portion = &reader[0..];
+
+        let mut encrypted = Vec::from(&packet[..8]);
+        context.decrypt_portion(plaintext_portion, &mut encrypted, ssrc, index);
+        let index_with_e_bit = index | 0x8000_0000; // "encrypted"-bit
+        track_try!(encrypted.write_u32be(index_with_e_bit));
+        Ok(encrypted)
+    }
+
     fn update_highest_recv_index(_context: &mut Context<Self>, _index: Self::PacketIndex) {
         // full packet inex is part of SRTCP packets, no need to keep track of it
+    }
+
+    fn update_highest_sent_index(context: &mut Context<Self>, index: Self::PacketIndex) {
+        // we're giving out indices in strictly ascending order in determine_outgoing_packet_index
+        context.protocol_specific.highest_sent_index = index;
     }
 }
 
@@ -289,6 +373,7 @@ where
             self.session_salt_key.len(),
         );
     }
+
     pub fn authenticate(&self, packet: &[u8]) -> Result<()> {
         let auth_portion = &packet[..packet.len() - self.auth_tag_len];
         let auth_tag = &packet[packet.len() - self.auth_tag_len..];
@@ -300,6 +385,14 @@ where
         track_assert_eq!(auth_tag, &expected_tag[..], ErrorKind::Invalid);
         Ok(())
     }
+
+    pub fn generate_auth_tag(&self, packet: &[u8]) -> Result<Vec<u8>> {
+        let auth_bytes = track_try!(P::get_authenticated_bytes(self, packet));
+        let mut tag = hmac_hash_sha1(&self.session_auth_key, &auth_bytes);
+        tag.truncate(self.auth_tag_len);
+        Ok(tag)
+    }
+
     pub fn decrypt_portion(
         &self,
         encrypted: &[u8],
@@ -326,13 +419,39 @@ where
         P::decrypt(self, packet, index)
     }
 
+    pub fn encrypt_portion(
+        &self,
+        plaintext: &[u8],
+        encrypted: &mut Vec<u8>,
+        ssrc: u32,
+        index: P::PacketIndex,
+    ) {
+        let iv = BigUint::from_bytes_be(&self.session_salt_key) << 16;
+        let iv = iv ^ (BigUint::from(ssrc) << 64);
+        let iv = iv ^ (index.into() << 16);
+        let iv = &iv.to_bytes_be()[0..self.session_encr_key.len()];
+
+        let mut ctr =
+            crypto::aes::ctr(crypto::aes::KeySize::KeySize128, &self.session_encr_key, iv);
+        let block_size = self.session_encr_key.len();
+
+        for block in plaintext.chunks(block_size) {
+            let old_len = encrypted.len();
+            encrypted.resize(old_len + block.len(), 0);
+            ctr.process(block, &mut encrypted[old_len..]);
+        }
+    }
+    pub fn encrypt(&mut self, packet: &[u8], index: P::PacketIndex) -> Result<Vec<u8>> {
+        P::encrypt(self, packet, index)
+    }
+
     // https://tools.ietf.org/html/rfc3711#section-3.3
     // https://tools.ietf.org/html/rfc3711#section-3.4
     pub fn process_incoming(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         // Step 1: determining the correct context (has already happened at this point)
 
         // Step 2: Determine index of the packet
-        let index = track_try!(P::determine_packet_index(self, packet));
+        let index = track_try!(P::determine_incoming_packet_index(self, packet));
 
         // Step 3: Determine master key and salt
         // TODO: support re-keying
@@ -351,6 +470,37 @@ where
         // Step 7: Update ROC, highest sequence number and replay protection
         // TODO: replay protection
         P::update_highest_recv_index(self, index);
+
+        Ok(result)
+    }
+
+    // https://tools.ietf.org/html/rfc3711#section-3.3
+    // https://tools.ietf.org/html/rfc3711#section-3.4
+    pub fn process_outgoing(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+        // Step 1: determining the correct context (has already happened at this point)
+
+        // Step 2: Determine index of the packet
+        let index = track_try!(P::determine_outgoing_packet_index(self, packet));
+
+        // Step 3: Determine master key and salt
+        // TODO: support re-keying
+        // TODO: support MKI
+
+        // Step 4: Determine session keys and salt
+        self.update_session_keys(index);
+
+        // Step 5: Encryption
+        let mut result = track_try!(self.encrypt(packet, index));
+
+        // Step 6: Append MKI if MKI indicator is set
+        // TODO: support MKI
+
+        // Step 7: Signing
+        let auth_tag = track_try!(self.generate_auth_tag(&result[..]));
+        result.extend(auth_tag);
+
+        // Step 7: Update ROC and highest sequence number
+        P::update_highest_sent_index(self, index);
 
         Ok(result)
     }
@@ -391,6 +541,37 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrtpPacketWriter<T> {
+    context: Context<Srtp>,
+    inner: T,
+}
+impl<T> SrtpPacketWriter<T>
+where
+    T: WritePacket,
+    T::Packet: RtpPacket,
+{
+    pub fn new(context: Context<Srtp>, inner: T) -> Self {
+        SrtpPacketWriter {
+            context: context,
+            inner: inner,
+        }
+    }
+}
+impl<T> WritePacket for SrtpPacketWriter<T>
+where
+    T: WritePacket,
+    T::Packet: RtpPacket,
+{
+    type Packet = T::Packet;
+    fn write_packet<W: Write>(&mut self, writer: &mut W, packet: &T::Packet) -> Result<()> {
+        let mut packet_bytes = Vec::new();
+        track_try!(self.inner.write_packet(&mut packet_bytes, packet));
+        let encrypted_packet_bytes = track_try!(self.context.process_outgoing(&packet_bytes));
+        track_err!(writer.write_all(&encrypted_packet_bytes))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrtcpPacketReader<T> {
     context: Context<Srtcp>,
     inner: T,
@@ -421,6 +602,37 @@ where
 
     fn supports_type(&self, ty: u8) -> bool {
         self.inner.supports_type(ty)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrtcpPacketWriter<T> {
+    context: Context<Srtcp>,
+    inner: T,
+}
+impl<T> SrtcpPacketWriter<T>
+where
+    T: WritePacket,
+    T::Packet: RtpPacket,
+{
+    pub fn new(context: Context<Srtcp>, inner: T) -> Self {
+        SrtcpPacketWriter {
+            context: context,
+            inner: inner,
+        }
+    }
+}
+impl<T> WritePacket for SrtcpPacketWriter<T>
+where
+    T: WritePacket,
+    T::Packet: RtpPacket,
+{
+    type Packet = T::Packet;
+    fn write_packet<W: Write>(&mut self, writer: &mut W, packet: &T::Packet) -> Result<()> {
+        let mut packet_bytes = Vec::new();
+        track_try!(self.inner.write_packet(&mut packet_bytes, packet));
+        let encrypted_packet_bytes = track_try!(self.context.process_outgoing(&packet_bytes));
+        track_err!(writer.write_all(&encrypted_packet_bytes))
     }
 }
 
@@ -472,42 +684,47 @@ mod test {
         let i = |roc, seq_num| ((roc as u64) << 16) + seq_num as u64;
         let estimate = |ctx: &Context<Srtp>, seq_num| Srtp::estimate_packet_index(ctx, seq_num);
 
-        context.protocol_specific.highest_recv_seq_num = 1000; // low highest_seq_num
+        context.protocol_specific.highest_seq_num = 1000; // low highest_seq_num
         assert_eq!(estimate(&context, 1), i(roc, 1)); // lower but same roc
         assert_eq!(estimate(&context, 10001), i(roc, 10001)); // higher but same roc
         assert_eq!(estimate(&context, 60001), i(roc_n1, 60001)); // roc-1
-        context.protocol_specific.highest_recv_seq_num = 60000; // high highest_seq_num
+        context.protocol_specific.highest_seq_num = 60000; // high highest_seq_num
         assert_eq!(estimate(&context, 60001), i(roc, 60001)); // higher but same roc
         assert_eq!(estimate(&context, 30001), i(roc, 30001)); // lower but same roc
         assert_eq!(estimate(&context, 10001), i(roc_p1, 10001)); // roc+1
     }
 
+    const TEST_MASTER_KEY: &[u8] = &[
+        211, 77, 116, 243, 125, 116, 231, 95, 59, 219, 79, 118, 241, 189, 244, 119,
+    ];
+    const TEST_MASTER_SALT: &[u8] = &[
+        127, 31, 227, 93, 120, 247, 126, 117, 231, 159, 123, 235, 95, 122,
+    ];
+    const TEST_SRTP_PACKET: &[u8] = &[
+        128, 0, 3, 92, 222, 161, 6, 76, 26, 163, 115, 130, 222, 0, 143, 87, 0, 227, 123, 91, 200,
+        238, 141, 220, 9, 191, 52, 111, 100, 62, 220, 158, 211, 79, 184, 199, 79, 182, 9, 248, 170,
+        82, 125, 152, 143, 206, 8, 152, 80, 207, 27, 183, 141, 77, 33, 60, 101, 180, 210, 146, 139,
+        170, 149, 13, 99, 75, 223, 156, 79, 71, 84, 119, 68, 236, 244, 163, 198, 175, 219, 160,
+        255, 9, 82, 169, 64, 112, 106, 4, 0, 246, 39, 29, 88, 15, 62, 174, 21, 253, 171, 198, 128,
+        61, 23, 43, 143, 255, 176, 125, 223, 23, 188, 90, 103, 139, 223, 56, 162, 35, 27, 225, 117,
+        243, 138, 163, 35, 79, 221, 201, 149, 154, 203, 255, 2, 23, 184, 184, 169, 32, 1, 138, 172,
+        60, 70, 240, 53, 11, 54, 81, 172, 214, 34, 136, 39, 152, 17, 247, 126, 199, 200, 184, 70,
+        7, 52, 191, 129, 239, 86, 78, 172, 229, 178, 112, 22, 125, 191, 164, 17, 193, 24, 152, 197,
+        146, 94, 74, 156, 171, 245, 239, 220, 205, 145, 206,
+    ];
+    const TEST_SRTCP_PACKET: &[u8] = &[
+        128, 201, 0, 1, 194, 242, 138, 93, 177, 31, 99, 88, 187, 209, 173, 181, 135, 18, 79, 59,
+        119, 153, 115, 34, 75, 94, 96, 29, 32, 14, 118, 86, 145, 159, 203, 174, 225, 34, 196, 229,
+        39, 22, 174, 54, 198, 56, 179, 171, 111, 229, 48, 234, 138, 249, 127, 11, 86, 94, 40, 213,
+        87, 203, 60, 54, 52, 60, 10, 93, 128, 0, 0, 1, 114, 135, 74, 73, 233, 100, 85, 240, 125,
+        93,
+    ];
+
     #[test]
     fn rtp_decryption_works() {
-        let master_key = [
-            211, 77, 116, 243, 125, 116, 231, 95, 59, 219, 79, 118, 241, 189, 244, 119,
-        ];
-        let master_salt = [
-            127, 31, 227, 93, 120, 247, 126, 117, 231, 159, 123, 235, 95, 122,
-        ];
-
-        let packet = [
-            128, 0, 3, 92, 222, 161, 6, 76, 26, 163, 115, 130, 222, 0, 143, 87, 0, 227, 123, 91,
-            200, 238, 141, 220, 9, 191, 52, 111, 100, 62, 220, 158, 211, 79, 184, 199, 79, 182, 9,
-            248, 170, 82, 125, 152, 143, 206, 8, 152, 80, 207, 27, 183, 141, 77, 33, 60, 101, 180,
-            210, 146, 139, 170, 149, 13, 99, 75, 223, 156, 79, 71, 84, 119, 68, 236, 244, 163, 198,
-            175, 219, 160, 255, 9, 82, 169, 64, 112, 106, 4, 0, 246, 39, 29, 88, 15, 62, 174, 21,
-            253, 171, 198, 128, 61, 23, 43, 143, 255, 176, 125, 223, 23, 188, 90, 103, 139, 223,
-            56, 162, 35, 27, 225, 117, 243, 138, 163, 35, 79, 221, 201, 149, 154, 203, 255, 2, 23,
-            184, 184, 169, 32, 1, 138, 172, 60, 70, 240, 53, 11, 54, 81, 172, 214, 34, 136, 39,
-            152, 17, 247, 126, 199, 200, 184, 70, 7, 52, 191, 129, 239, 86, 78, 172, 229, 178, 112,
-            22, 125, 191, 164, 17, 193, 24, 152, 197, 146, 94, 74, 156, 171, 245, 239, 220, 205,
-            145, 206,
-        ];
-
-        let context = Context::new_srtp(&master_key, &master_salt);
+        let context = Context::new_srtp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
         let mut rtp_reader = SrtpPacketReader::new(context, rfc3550::RtpPacketReader);
-        let packet = rtp_reader.read_packet(&mut &packet[..]).unwrap();
+        let packet = rtp_reader.read_packet(&mut TEST_SRTP_PACKET).unwrap();
 
         let expected_prefix = [
             0xbe, 0x9c, 0x8c, 0x86, 0x81, 0x80, 0x81, 0x86, 0x8d, 0x9c, 0xfd, 0x1b, 0x0d, 0x05,
@@ -541,5 +758,36 @@ mod test {
         let mut rtcp_reader = SrtcpPacketReader::new(context, rfc4585::RtcpPacketReader);
         let packet = track_try_unwrap!(rtcp_reader.read_packet(&mut &packet[..]));
         println!("# {:?}", packet);
+    }
+
+    #[test]
+    fn rtp_decryption_encryption_are_inverse() {
+        let mut dec_context = Context::new_srtp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        let mut enc_context = Context::new_srtp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        let decrypted = track_try_unwrap!(dec_context.process_incoming(TEST_SRTP_PACKET));
+        let encrypted = track_try_unwrap!(enc_context.process_outgoing(&decrypted));
+        assert_eq!(&encrypted[..], TEST_SRTP_PACKET);
+    }
+
+    #[test]
+    fn rtcp_decryption_encryption_are_inverse() {
+        let mut dec_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        let mut enc_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        let decrypted = track_try_unwrap!(dec_context.process_incoming(TEST_SRTCP_PACKET));
+        let encrypted = track_try_unwrap!(enc_context.process_outgoing(&decrypted));
+        assert_eq!(&encrypted[..], TEST_SRTCP_PACKET);
+    }
+
+    #[test]
+    fn rtcp_encryption_does_not_use_two_time_pad() {
+        let mut dec_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        let mut enc_context = Context::new_srtcp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
+        let decrypted = track_try_unwrap!(dec_context.process_incoming(TEST_SRTCP_PACKET));
+        let encrypted_1 = track_try_unwrap!(enc_context.process_outgoing(&decrypted));
+        let encrypted_2 = track_try_unwrap!(enc_context.process_outgoing(&decrypted));
+        let encrypted_3 = track_try_unwrap!(enc_context.process_outgoing(&decrypted));
+        assert_ne!(encrypted_1, encrypted_2);
+        assert_ne!(encrypted_1, encrypted_3);
+        assert_ne!(encrypted_2, encrypted_3);
     }
 }

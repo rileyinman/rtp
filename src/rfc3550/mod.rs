@@ -1,8 +1,12 @@
-pub use self::rtp::{RtpFixedHeader, RtpHeaderExtension, RtpPacket, RtpPacketReader};
+pub use self::rtp::{
+    RtpFixedHeader, RtpHeaderExtension, RtpPacket, RtpPacketReader, RtpPacketWriter,
+};
 
 pub use self::rtcp::{ReceptionReport, RtcpCompoundPacket, SdesChunk, SdesItem};
 pub use self::rtcp::{RtcpApplicationDefined, RtcpGoodbye, RtcpSourceDescription};
-pub use self::rtcp::{RtcpPacket, RtcpPacketReader, RtcpReceiverReport, RtcpSenderReport};
+pub use self::rtcp::{
+    RtcpPacket, RtcpPacketReader, RtcpPacketWriter, RtcpReceiverReport, RtcpSenderReport,
+};
 
 pub use self::rtcp::{RTCP_PACKET_TYPE_APP, RTCP_PACKET_TYPE_BYE};
 pub use self::rtcp::{RTCP_PACKET_TYPE_RR, RTCP_PACKET_TYPE_SDES, RTCP_PACKET_TYPE_SR};

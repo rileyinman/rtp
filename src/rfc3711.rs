@@ -49,6 +49,7 @@ pub trait Protocol: Sized {
     ) -> Result<Self::PacketIndex>;
     fn get_authenticated_bytes<'a>(
         context: &Context<Self>,
+        index: Self::PacketIndex,
         auth_portion: &'a [u8],
     ) -> Result<Cow<'a, [u8]>>;
     fn decrypt(context: &Context<Self>, packet: &[u8], index: Self::PacketIndex)
@@ -175,10 +176,11 @@ impl Protocol for Srtp {
 
     fn get_authenticated_bytes<'a>(
         context: &Context<Self>,
+        index: Self::PacketIndex,
         auth_portion: &'a [u8],
     ) -> Result<Cow<'a, [u8]>> {
         // For SRTP, the ROC is part of the authenticated bytes (but not in the actual packet)
-        let roc = context.protocol_specific.rollover_counter;
+        let roc = (index >> 16) as u32;
         let mut auth_bytes = Vec::from(auth_portion);
         track_try!((&mut auth_bytes).write_u32be(roc));
         Ok(Cow::Owned(auth_bytes))
@@ -263,6 +265,7 @@ impl Protocol for Srtcp {
 
     fn get_authenticated_bytes<'a>(
         _context: &Context<Self>,
+        index: Self::PacketIndex,
         auth_portion: &'a [u8],
     ) -> Result<Cow<'a, [u8]>> {
         // For SRTCP the full packet index is already part of the packet
@@ -376,11 +379,11 @@ where
         );
     }
 
-    pub fn authenticate(&self, packet: &[u8]) -> Result<()> {
+    pub fn authenticate(&self, packet: &[u8], index: P::PacketIndex) -> Result<()> {
         let auth_portion = &packet[..packet.len() - self.auth_tag_len];
         let auth_tag = &packet[packet.len() - self.auth_tag_len..];
 
-        let auth_bytes = track_try!(P::get_authenticated_bytes(self, auth_portion));
+        let auth_bytes = track_try!(P::get_authenticated_bytes(self, index, auth_portion));
 
         let mut expected_tag = hmac_hash_sha1(&self.session_auth_key, &auth_bytes);
         expected_tag.truncate(self.auth_tag_len);
@@ -388,8 +391,8 @@ where
         Ok(())
     }
 
-    pub fn generate_auth_tag(&self, packet: &[u8]) -> Result<Vec<u8>> {
-        let auth_bytes = track_try!(P::get_authenticated_bytes(self, packet));
+    pub fn generate_auth_tag(&self, packet: &[u8], index: P::PacketIndex) -> Result<Vec<u8>> {
+        let auth_bytes = track_try!(P::get_authenticated_bytes(self, index, packet));
         let mut tag = hmac_hash_sha1(&self.session_auth_key, &auth_bytes);
         tag.truncate(self.auth_tag_len);
         Ok(tag)
@@ -475,7 +478,7 @@ where
                 ErrorKind::Invalid
             );
         }
-        track_try!(self.authenticate(packet));
+        track_try!(self.authenticate(packet, index));
 
         // Step 6: Decryption
         let result = track_try!(self.decrypt(packet, index));
@@ -524,7 +527,7 @@ where
         // TODO: support MKI
 
         // Step 7: Signing
-        let auth_tag = track_try!(self.generate_auth_tag(&result[..]));
+        let auth_tag = track_try!(self.generate_auth_tag(&result[..], index));
         result.extend(auth_tag);
 
         // Step 7: Update ROC and highest sequence number

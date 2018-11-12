@@ -748,6 +748,29 @@ mod test {
         93,
     ];
 
+    const TEST_2_MASTER_KEY: &[u8] = &[
+        124, 185, 61, 185, 219, 148, 249, 33, 222, 227, 189, 112, 23, 80, 114, 233,
+    ];
+    const TEST_2_MASTER_SALT: &[u8] = &[93, 4, 23, 245, 147, 199, 112, 49, 24, 105, 140, 1, 77, 98];
+    const TEST_2_SRTP_PACKET_BEFORE_ROLLOVER: &[u8] = &[
+        0x80, 0x61, 0xff, 0xff, 0x87, 0xf5, 0xee, 0x93, 0x0a, 0xc3, 0xc2, 0xbd, 0x93, 0x04, 0x0b,
+        0x4d, 0xe9, 0x55, 0x69, 0xb7, 0xac, 0x88, 0xc5, 0xd6, 0xc2, 0x75, 0xb8, 0x15, 0x86, 0xc3,
+        0xb2, 0x2a, 0x34, 0x64, 0xbe, 0x8b, 0x0d, 0x61, 0xfc, 0x22, 0xf1, 0x30, 0x66, 0xe0, 0x1e,
+        0x1d, 0x0c, 0xec, 0xff, 0x8d, 0xff, 0x86, 0xf7, 0xf4, 0x7e, 0x40, 0x8a, 0xd0, 0x36, 0x3f,
+        0x67, 0x60, 0x0f, 0xbd, 0x46, 0xa9, 0x3e, 0xa5, 0x4b, 0x31, 0x54, 0xc8, 0x45, 0x61, 0xc8,
+        0x33, 0x68, 0x2b, 0x0c, 0x98, 0x5f, 0x61, 0x68, 0xc4, 0x32, 0x8f, 0x70, 0xc4, 0xc6, 0x05,
+        0x7e, 0x30, 0xcf, 0x67, 0x78, 0xf4, 0x50, 0x1b, 0xba, 0x5f, 0x10, 0x5f, 0xf6, 0x6b, 0x99,
+        0x6d, 0x68, 0xb8, 0x87, 0x21, 0x46, 0xd1, 0x4a, 0x4a,
+    ];
+    const TEST_2_SRTP_PACKET_AFTER_ROLLOVER: &[u8] = &[
+        128, 97, 0, 0, 135, 245, 242, 83, 10, 195, 194, 189, 254, 253, 61, 217, 224, 102, 52, 18,
+        244, 100, 144, 73, 190, 225, 100, 195, 28, 35, 116, 15, 37, 91, 236, 28, 24, 134, 223, 188,
+        129, 1, 164, 18, 143, 87, 6, 25, 195, 159, 33, 147, 36, 175, 190, 60, 215, 204, 240, 27,
+        186, 247, 223, 217, 65, 189, 66, 59, 3, 214, 53, 146, 32, 234, 27, 127, 211, 58, 156, 25,
+        139, 236, 11, 138, 245, 134, 84, 164, 130, 226, 90, 74, 131, 57, 100, 0, 106, 127, 239,
+        184, 235, 197, 164, 15, 233, 146, 84, 127, 42, 9, 100,
+    ];
+
     #[test]
     fn rtp_decryption_works() {
         let context = Context::new_srtp(&TEST_MASTER_KEY, &TEST_MASTER_SALT);
@@ -764,6 +787,19 @@ mod test {
             &packet.payload[..expected_prefix.len()],
             &expected_prefix[..]
         );
+    }
+
+    #[test]
+    fn rtp_decryption_with_rollover_works() {
+        let mut context = Context::new_srtp(&TEST_2_MASTER_KEY, &TEST_2_MASTER_SALT);
+        context.protocol_specific.highest_seq_num = 65534;
+        let mut rtp_reader = SrtpPacketReader::new(context, rfc3550::RtpPacketReader);
+        rtp_reader
+            .read_packet(&mut TEST_2_SRTP_PACKET_BEFORE_ROLLOVER)
+            .unwrap();
+        rtp_reader
+            .read_packet(&mut TEST_2_SRTP_PACKET_AFTER_ROLLOVER)
+            .unwrap();
     }
 
     #[test]

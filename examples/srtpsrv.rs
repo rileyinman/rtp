@@ -39,7 +39,7 @@ fn main() {
 
     let master_key = hex_str_to_bytes(matches.value_of("MASTER_KEY").unwrap());
     let master_salt = hex_str_to_bytes(matches.value_of("MASTER_SALT").unwrap());
-    let context = Context::new_srtp(&master_key, &master_salt);
+    let context = Context::<Srtp>::new(&master_key, &master_salt);
     let future = track_err!(UdpSocket::bind(addr))
         .and_then(move |socket| SrtpRecvLoop::new(socket, context));
 

@@ -196,7 +196,7 @@ impl Protocol for Srtp {
     }
 
     fn get_authenticated_bytes<'a>(
-        context: &Context<Self>,
+        _context: &Context<Self>,
         index: Self::PacketIndex,
         auth_portion: &'a [u8],
     ) -> Result<Cow<'a, [u8]>> {
@@ -295,7 +295,7 @@ impl Protocol for Srtcp {
 
     fn get_authenticated_bytes<'a>(
         _context: &Context<Self>,
-        index: Self::PacketIndex,
+        _index: Self::PacketIndex,
         auth_portion: &'a [u8],
     ) -> Result<Cow<'a, [u8]>> {
         // For SRTCP the full packet index is already part of the packet

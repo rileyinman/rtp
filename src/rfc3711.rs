@@ -85,6 +85,7 @@ pub struct Context<P: Protocol> {
     pub encryption: EncryptionAlgorithm,
     pub authentication: AuthenticationAlgorithm,
     pub auth_tag_len: usize,
+    pub unknown_ssrcs: usize,
     pub ssrc_context: BTreeMap<u32, SsrcContext<P>>,
 }
 
@@ -366,6 +367,7 @@ where
             encryption: EncryptionAlgorithm::default(),
             authentication: AuthenticationAlgorithm::default(),
             auth_tag_len: 80 / 8,
+            unknown_ssrcs: 0,
             ssrc_context: BTreeMap::new(),
         }
     }
@@ -384,6 +386,10 @@ where
             "SSRC {} had already been added",
             ssrc
         );
+    }
+
+    pub fn add_unknown_ssrcs(&mut self, count: usize) {
+        self.unknown_ssrcs += count;
     }
 
     pub fn update_session_keys(&mut self, ssrc: Ssrc, index: P::PacketIndex) {
@@ -528,7 +534,19 @@ where
     pub fn process_incoming(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         // Step 1: determining the correct context
         let ssrc = track_try!(P::read_ssrc(packet));
-        track_assert!(self.ssrc_context.contains_key(&ssrc), ErrorKind::Invalid, "Unknown SSRC {}", ssrc);
+        if !self.ssrc_context.contains_key(&ssrc) {
+            track_assert!(self.unknown_ssrcs > 0, ErrorKind::Invalid, "Unknown SSRC {}", ssrc);
+            self.unknown_ssrcs -= 1;
+            let ssrc_context = SsrcContext {
+                replay_window_head: 0,
+                replay_window: FixedBitSet::with_capacity(128),
+                session_encr_key: vec![0; 128 / 8],
+                session_salt_key: vec![0; 112 / 8],
+                session_auth_key: vec![0; 160 / 8],
+                protocol_specific: P::default(),
+            };
+            self.ssrc_context.insert(ssrc, ssrc_context);
+        }
 
         // Step 2: Determine index of the packet
         let index = track_try!(P::determine_incoming_packet_index(
@@ -600,7 +618,19 @@ where
     pub fn process_outgoing(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
         // Step 1: determining the correct context
         let ssrc = track_try!(P::read_ssrc(packet));
-        track_assert!(self.ssrc_context.contains_key(&ssrc), ErrorKind::Invalid, "Unknown SSRC {}", ssrc);
+        if !self.ssrc_context.contains_key(&ssrc) {
+            track_assert!(self.unknown_ssrcs > 0, ErrorKind::Invalid, "Unknown SSRC {}", ssrc);
+            self.unknown_ssrcs -= 1;
+            let ssrc_context = SsrcContext {
+                replay_window_head: 0,
+                replay_window: FixedBitSet::with_capacity(128),
+                session_encr_key: vec![0; 128 / 8],
+                session_salt_key: vec![0; 112 / 8],
+                session_auth_key: vec![0; 160 / 8],
+                protocol_specific: P::default(),
+            };
+            self.ssrc_context.insert(ssrc, ssrc_context);
+        }
 
         // Step 2: Determine index of the packet
         let index = track_try!(P::determine_outgoing_packet_index(

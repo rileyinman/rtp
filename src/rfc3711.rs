@@ -1,3 +1,4 @@
+// FIXME: saveguard against two-time pad by running replay-protection on outgoing packets
 use crypto;
 use fixedbitset::FixedBitSet;
 use handy_async::sync_io::{ReadExt, WriteExt};
@@ -829,7 +830,7 @@ fn prf_n(master_key: &[u8], x: BigUint, n: usize) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
     use rfc3550;
     use rfc4585;
@@ -855,14 +856,14 @@ mod test {
         assert_eq!(estimate(&context, 10001), i(roc_p1, 10001)); // roc+1
     }
 
-    const TEST_MASTER_KEY: &[u8] = &[
+    pub(crate) const TEST_MASTER_KEY: &[u8] = &[
         211, 77, 116, 243, 125, 116, 231, 95, 59, 219, 79, 118, 241, 189, 244, 119,
     ];
-    const TEST_MASTER_SALT: &[u8] = &[
+    pub(crate) const TEST_MASTER_SALT: &[u8] = &[
         127, 31, 227, 93, 120, 247, 126, 117, 231, 159, 123, 235, 95, 122,
     ];
-    const TEST_SRTP_SSRC: Ssrc = 446919554;
-    const TEST_SRTP_PACKET: &[u8] = &[
+    pub(crate) const TEST_SRTP_SSRC: Ssrc = 446919554;
+    pub(crate) const TEST_SRTP_PACKET: &[u8] = &[
         128, 0, 3, 92, 222, 161, 6, 76, 26, 163, 115, 130, 222, 0, 143, 87, 0, 227, 123, 91, 200,
         238, 141, 220, 9, 191, 52, 111, 100, 62, 220, 158, 211, 79, 184, 199, 79, 182, 9, 248, 170,
         82, 125, 152, 143, 206, 8, 152, 80, 207, 27, 183, 141, 77, 33, 60, 101, 180, 210, 146, 139,
@@ -874,8 +875,8 @@ mod test {
         7, 52, 191, 129, 239, 86, 78, 172, 229, 178, 112, 22, 125, 191, 164, 17, 193, 24, 152, 197,
         146, 94, 74, 156, 171, 245, 239, 220, 205, 145, 206,
     ];
-    const TEST_SRTCP_SSRC: Ssrc = 3270675037;
-    const TEST_SRTCP_PACKET: &[u8] = &[
+    pub(crate) const TEST_SRTCP_SSRC: Ssrc = 3270675037;
+    pub(crate) const TEST_SRTCP_PACKET: &[u8] = &[
         128, 201, 0, 1, 194, 242, 138, 93, 177, 31, 99, 88, 187, 209, 173, 181, 135, 18, 79, 59,
         119, 153, 115, 34, 75, 94, 96, 29, 32, 14, 118, 86, 145, 159, 203, 174, 225, 34, 196, 229,
         39, 22, 174, 54, 198, 56, 179, 171, 111, 229, 48, 234, 138, 249, 127, 11, 86, 94, 40, 213,

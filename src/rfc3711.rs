@@ -471,7 +471,8 @@ where
         let iv = BigUint::from_bytes_be(&context.session_salt_key) << 16;
         let iv = iv ^ (BigUint::from(ssrc) << 64);
         let iv = iv ^ (index.into() << 16);
-        let iv = &iv.to_bytes_be()[0..context.session_encr_key.len()];
+        let iv = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
+        let iv = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
 
         let mut ctr = crypto::aes::ctr(
             crypto::aes::KeySize::KeySize128,
@@ -506,7 +507,8 @@ where
         let iv = BigUint::from_bytes_be(&context.session_salt_key) << 16;
         let iv = iv ^ (BigUint::from(ssrc) << 64);
         let iv = iv ^ (index.into() << 16);
-        let iv = &iv.to_bytes_be()[0..context.session_encr_key.len()];
+        let iv = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
+        let iv = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
 
         let mut ctr = crypto::aes::ctr(
             crypto::aes::KeySize::KeySize128,

@@ -510,10 +510,10 @@ impl WriteTo for SdesChunk {
             write_bytes += 1;
 
             let text = item.text();
-            track_assert!(text.len() <= 0xFFFF, ErrorKind::Invalid);
-            track_try!(writer.write_u16be(text.len() as u16));
+            track_assert!(text.len() <= 0xFF, ErrorKind::Invalid);
+            track_try!(writer.write_u8(text.len() as u8));
             track_try!(writer.write_all(text.as_bytes()));
-            write_bytes += 2 + text.len();
+            write_bytes += 1 + text.len();
         }
         track_try!(writer.write_u8(SDES_ITEM_TYPE_END));
         write_bytes += 1;

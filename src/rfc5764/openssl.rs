@@ -5,7 +5,7 @@ use openssl::ssl::{
     HandshakeError, MidHandshakeSslStream, SslAcceptorBuilder, SslConnectorBuilder, SslStream,
 };
 
-use rfc5764::{Dtls, DtlsBuilder, DtlsHandshakeResult, DtlsMidHandshake, SrtpProtectionProfile};
+use crate::rfc5764::{Dtls, DtlsBuilder, DtlsHandshakeResult, DtlsMidHandshake, SrtpProtectionProfile};
 
 impl<S: Read + Write + Sync> DtlsBuilder<S> for SslConnectorBuilder {
     type Instance = SslStream<S>;
@@ -100,8 +100,8 @@ impl<S: Read + Write> Dtls<S> for SslStream<S> {
 
 #[cfg(test)]
 mod test {
-    use rfc5764::test::DummyTransport;
-    use rfc5764::{DtlsSrtp, DtlsSrtpHandshakeResult};
+    use crate::rfc5764::test::DummyTransport;
+    use crate::rfc5764::{DtlsSrtp, DtlsSrtpHandshakeResult};
 
     use openssl::asn1::Asn1Time;
     use openssl::hash::MessageDigest;

@@ -12,8 +12,8 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use rfc3711::{AuthenticationAlgorithm, Context, EncryptionAlgorithm, Srtcp, Srtp};
-use types::Ssrc;
+use crate::rfc3711::{AuthenticationAlgorithm, Context, EncryptionAlgorithm, Srtcp, Srtp};
+use crate::types::Ssrc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrtpProtectionProfile {
@@ -368,7 +368,7 @@ where
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use rfc3711::test::{
+    use crate::rfc3711::test::{
         TEST_MASTER_KEY, TEST_MASTER_SALT, TEST_SRTCP_PACKET, TEST_SRTCP_SSRC, TEST_SRTP_PACKET,
         TEST_SRTP_SSRC,
     };

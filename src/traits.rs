@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 
-use Result;
+use crate::Result;
 
 pub trait Packet {}
 

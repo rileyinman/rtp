@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
+use trackable::*;
 
-use Result;
+use crate::Result;
 
 pub trait ReadFrom: Sized {
     fn read_from<R: Read>(reader: &mut R) -> Result<Self>;

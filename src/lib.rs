@@ -1,16 +1,9 @@
-#[macro_use]
-extern crate trackable;
-extern crate crypto;
-extern crate handy_async;
-extern crate num;
-extern crate fixedbitset;
-
 #[cfg(feature = "openssl")]
 extern crate openssl;
 #[cfg(feature = "tokio")]
 extern crate tokio;
 
-pub use error::{Error, ErrorKind};
+pub use crate::error::{Error, ErrorKind};
 
 pub mod io;
 pub mod rfc3550;

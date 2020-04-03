@@ -1,7 +1,7 @@
 use std::io;
 use tokio::prelude::{Async, AsyncRead, AsyncSink, AsyncWrite, Future, Sink, Stream};
 
-use rfc5764::{DtlsBuilder, DtlsSrtp, DtlsSrtpHandshakeResult, DtlsSrtpMuxerPart};
+use crate::rfc5764::{DtlsBuilder, DtlsSrtp, DtlsSrtpHandshakeResult, DtlsSrtpMuxerPart};
 
 impl<S, D> AsyncRead for DtlsSrtp<S, D>
 where

@@ -1,19 +1,22 @@
+use async_trait::async_trait;
+use futures::io::{AsyncRead, AsyncWrite};
 use std::io;
-use std::io::{Read, Write};
+use tokio_openssl::SslStream;
+use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, Tokio02AsyncReadCompatExt};
 
-use openssl::ssl::{
-    HandshakeError, MidHandshakeSslStream, SslAcceptorBuilder, SslConnectorBuilder, SslStream,
-};
+use openssl::ssl::{ConnectConfiguration, SslAcceptorBuilder};
 
-use crate::rfc5764::{Dtls, DtlsBuilder, DtlsHandshakeResult, DtlsMidHandshake, SrtpProtectionProfile};
+use crate::rfc5764::{Dtls, DtlsBuilder, SrtpProtectionProfile};
 
-impl<S: Read + Write + Sync> DtlsBuilder<S> for SslConnectorBuilder {
-    type Instance = SslStream<S>;
-    type MidHandshake = MidHandshakeSslStream<S>;
+type CompatSslStream<S> = Compat<SslStream<Compat<S>>>;
 
-    fn handshake(mut self, stream: S) -> DtlsHandshakeResult<Self::Instance, Self::MidHandshake>
+#[async_trait]
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> DtlsBuilder<S> for ConnectConfiguration {
+    type Instance = CompatSslStream<S>;
+
+    async fn handshake(mut self, stream: S) -> Result<Self::Instance, io::Error>
     where
-        S: Read + Write,
+        S: 'async_trait,
     {
         let profiles_str: String = SrtpProtectionProfile::RECOMMENDED
             .iter()
@@ -21,28 +24,20 @@ impl<S: Read + Write + Sync> DtlsBuilder<S> for SslConnectorBuilder {
             .collect::<Vec<_>>()
             .join(":");
         self.set_tlsext_use_srtp(&profiles_str).unwrap();
-        match self.build().connect("invalid", stream) {
-            Ok(stream) => DtlsHandshakeResult::Success(stream),
-            Err(HandshakeError::WouldBlock(mid_handshake)) => {
-                DtlsHandshakeResult::WouldBlock(mid_handshake)
-            }
-            Err(HandshakeError::Failure(mid_handshake)) => DtlsHandshakeResult::Failure(
-                io::Error::new(io::ErrorKind::Other, mid_handshake.into_error()),
-            ),
-            Err(HandshakeError::SetupFailure(err)) => {
-                DtlsHandshakeResult::Failure(io::Error::new(io::ErrorKind::Other, err))
-            }
+        match tokio_openssl::connect(self, "invalid", stream.compat()).await {
+            Ok(stream) => Ok(stream.compat()),
+            Err(_) => Err(io::Error::new(io::ErrorKind::Other, "handshake error")),
         }
     }
 }
 
-impl<S: Read + Write + Sync> DtlsBuilder<S> for SslAcceptorBuilder {
-    type Instance = SslStream<S>;
-    type MidHandshake = MidHandshakeSslStream<S>;
+#[async_trait]
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> DtlsBuilder<S> for SslAcceptorBuilder {
+    type Instance = CompatSslStream<S>;
 
-    fn handshake(mut self, stream: S) -> DtlsHandshakeResult<Self::Instance, Self::MidHandshake>
+    async fn handshake(mut self, stream: S) -> Result<Self::Instance, io::Error>
     where
-        S: Read + Write,
+        S: 'async_trait,
     {
         let profiles_str: String = SrtpProtectionProfile::RECOMMENDED
             .iter()
@@ -50,48 +45,22 @@ impl<S: Read + Write + Sync> DtlsBuilder<S> for SslAcceptorBuilder {
             .collect::<Vec<_>>()
             .join(":");
         self.set_tlsext_use_srtp(&profiles_str).unwrap();
-        match self.build().accept(stream) {
-            Ok(stream) => DtlsHandshakeResult::Success(stream),
-            Err(HandshakeError::WouldBlock(mid_handshake)) => {
-                DtlsHandshakeResult::WouldBlock(mid_handshake)
-            }
-            Err(HandshakeError::Failure(mid_handshake)) => DtlsHandshakeResult::Failure(
-                io::Error::new(io::ErrorKind::Other, mid_handshake.into_error()),
-            ),
-            Err(HandshakeError::SetupFailure(err)) => {
-                DtlsHandshakeResult::Failure(io::Error::new(io::ErrorKind::Other, err))
-            }
+        match tokio_openssl::accept(&self.build(), stream.compat()).await {
+            Ok(stream) => Ok(stream.compat()),
+            Err(_) => Err(io::Error::new(io::ErrorKind::Other, "handshake error")),
         }
     }
 }
 
-impl<S: Read + Write + Sync> DtlsMidHandshake<S> for MidHandshakeSslStream<S> {
-    type Instance = SslStream<S>;
-
-    fn handshake(self) -> DtlsHandshakeResult<Self::Instance, Self> {
-        match MidHandshakeSslStream::handshake(self) {
-            Ok(stream) => DtlsHandshakeResult::Success(stream),
-            Err(HandshakeError::WouldBlock(mid_handshake)) => {
-                DtlsHandshakeResult::WouldBlock(mid_handshake)
-            }
-            Err(HandshakeError::Failure(mid_handshake)) => DtlsHandshakeResult::Failure(
-                io::Error::new(io::ErrorKind::Other, mid_handshake.into_error()),
-            ),
-            Err(HandshakeError::SetupFailure(err)) => {
-                DtlsHandshakeResult::Failure(io::Error::new(io::ErrorKind::Other, err))
-            }
-        }
-    }
-}
-
-impl<S: Read + Write> Dtls<S> for SslStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> Dtls<S> for Compat<SslStream<Compat<S>>> {
     fn is_server_side(&self) -> bool {
-        self.ssl().is_server()
+        self.get_ref().ssl().is_server()
     }
 
     fn export_key(&mut self, exporter_label: &str, length: usize) -> Vec<u8> {
         let mut vec = vec![0; length];
-        self.ssl()
+        self.get_mut()
+            .ssl()
             .export_keying_material(&mut vec, exporter_label, None)
             .unwrap();
         vec
@@ -101,14 +70,16 @@ impl<S: Read + Write> Dtls<S> for SslStream<S> {
 #[cfg(test)]
 mod test {
     use crate::rfc5764::test::DummyTransport;
-    use crate::rfc5764::{DtlsSrtp, DtlsSrtpHandshakeResult};
+    use crate::rfc5764::DtlsSrtp;
 
+    use futures::FutureExt;
     use openssl::asn1::Asn1Time;
     use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
     use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
     use openssl::x509::X509;
+    use std::task::{Context, Poll};
 
     #[test]
     fn connect_and_establish_matching_key_material() {
@@ -134,54 +105,33 @@ mod test {
         acceptor.set_private_key(&key).unwrap();
         acceptor.set_verify(SslVerifyMode::NONE);
         connector.set_verify(SslVerifyMode::NONE);
-        let mut handshake_server = DtlsSrtp::handshake(server_sock, acceptor);
-        let mut handshake_client = DtlsSrtp::handshake(client_sock, connector);
+        let handshake_server = DtlsSrtp::handshake(server_sock, acceptor);
+        let handshake_client =
+            DtlsSrtp::handshake(client_sock, connector.build().configure().unwrap());
+        let mut future = futures::future::join(handshake_server, handshake_client).boxed();
 
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         loop {
-            match (handshake_client, handshake_server) {
-                (DtlsSrtpHandshakeResult::Failure(err), _) => {
-                    panic!("Client error: {}", err);
-                }
-                (_, DtlsSrtpHandshakeResult::Failure(err)) => {
-                    panic!("Server error: {}", err);
-                }
-                (
-                    DtlsSrtpHandshakeResult::Success(client),
-                    DtlsSrtpHandshakeResult::Success(server),
-                ) => {
-                    assert_eq!(
-                        client.srtp_read_context.master_key,
-                        server.srtp_write_context.master_key
-                    );
-                    assert_eq!(
-                        client.srtp_read_context.master_salt,
-                        server.srtp_write_context.master_salt
-                    );
-                    assert_eq!(
-                        client.srtp_write_context.master_key,
-                        server.srtp_read_context.master_key
-                    );
-                    assert_eq!(
-                        client.srtp_write_context.master_salt,
-                        server.srtp_read_context.master_salt
-                    );
-                    return;
-                }
-                (
-                    DtlsSrtpHandshakeResult::WouldBlock(client),
-                    DtlsSrtpHandshakeResult::WouldBlock(server),
-                ) => {
-                    handshake_client = client.handshake();
-                    handshake_server = server.handshake();
-                }
-                (client, DtlsSrtpHandshakeResult::WouldBlock(server)) => {
-                    handshake_client = client;
-                    handshake_server = server.handshake();
-                }
-                (DtlsSrtpHandshakeResult::WouldBlock(client), server) => {
-                    handshake_client = client.handshake();
-                    handshake_server = server;
-                }
+            if let Poll::Ready((server, client)) = future.as_mut().poll(&mut cx) {
+                let server = server.unwrap();
+                let client = client.unwrap();
+                assert_eq!(
+                    client.srtp_read_context.master_key,
+                    server.srtp_write_context.master_key
+                );
+                assert_eq!(
+                    client.srtp_read_context.master_salt,
+                    server.srtp_write_context.master_salt
+                );
+                assert_eq!(
+                    client.srtp_write_context.master_key,
+                    server.srtp_read_context.master_key
+                );
+                assert_eq!(
+                    client.srtp_write_context.master_salt,
+                    server.srtp_read_context.master_salt
+                );
+                return;
             }
         }
     }

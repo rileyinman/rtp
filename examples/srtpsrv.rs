@@ -1,6 +1,6 @@
 extern crate clap;
 extern crate fibers;
-extern crate futures;
+extern crate futures01 as futures;
 #[macro_use]
 extern crate trackable;
 extern crate rtp;

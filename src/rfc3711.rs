@@ -1,8 +1,7 @@
 // FIXME: saveguard against two-time pad by running replay-protection on outgoing packets
-use crypto;
 use fixedbitset::FixedBitSet;
 use handy_async::sync_io::{ReadExt, WriteExt};
-use num::BigUint;
+use num::{BigUint, Integer};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -13,6 +12,8 @@ use crate::rfc3550;
 use crate::traits::{ReadPacket, RtcpPacket, RtpPacket, WritePacket};
 use crate::types::{Ssrc, U48};
 use crate::{ErrorKind, Result};
+use aes_ctr::cipher::{NewStreamCipher, SyncStreamCipher};
+use hmac::{Mac, NewMac};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionAlgorithm {
@@ -475,17 +476,15 @@ where
         let iv = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
         let iv = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
 
-        let mut ctr = crypto::aes::ctr(
-            crypto::aes::KeySize::KeySize128,
-            &context.session_encr_key,
-            iv,
-        );
+        let mut ctr =
+            aes_ctr::Aes128Ctr::new_var(&context.session_encr_key, iv).expect("Correct Key Length");
+
         let block_size = context.session_encr_key.len();
 
         for block in encrypted.chunks(block_size) {
             let old_len = decrypted.len();
-            decrypted.resize(old_len + block.len(), 0);
-            ctr.process(block, &mut decrypted[old_len..]);
+            decrypted.extend_from_slice(block);
+            ctr.apply_keystream(&mut decrypted[old_len..]);
         }
     }
     pub fn decrypt(
@@ -511,17 +510,14 @@ where
         let iv = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
         let iv = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
 
-        let mut ctr = crypto::aes::ctr(
-            crypto::aes::KeySize::KeySize128,
-            &context.session_encr_key,
-            iv,
-        );
+        let mut ctr =
+            aes_ctr::Aes128Ctr::new_var(&context.session_encr_key, iv).expect("Correct Key Length");
         let block_size = context.session_encr_key.len();
 
         for block in plaintext.chunks(block_size) {
             let old_len = encrypted.len();
-            encrypted.resize(old_len + block.len(), 0);
-            ctr.process(block, &mut encrypted[old_len..]);
+            encrypted.extend_from_slice(block);
+            ctr.apply_keystream(&mut encrypted[old_len..]);
         }
     }
     pub fn encrypt(
@@ -539,7 +535,12 @@ where
         // Step 1: determining the correct context
         let ssrc = track_try!(P::read_ssrc(packet));
         if !self.ssrc_context.contains_key(&ssrc) {
-            track_assert!(self.unknown_ssrcs > 0, ErrorKind::Invalid, "Unknown SSRC {}", ssrc);
+            track_assert!(
+                self.unknown_ssrcs > 0,
+                ErrorKind::Invalid,
+                "Unknown SSRC {}",
+                ssrc
+            );
             self.unknown_ssrcs -= 1;
             let ssrc_context = SsrcContext {
                 replay_window_head: 0,
@@ -623,7 +624,12 @@ where
         // Step 1: determining the correct context
         let ssrc = track_try!(P::read_ssrc(packet));
         if !self.ssrc_context.contains_key(&ssrc) {
-            track_assert!(self.unknown_ssrcs > 0, ErrorKind::Invalid, "Unknown SSRC {}", ssrc);
+            track_assert!(
+                self.unknown_ssrcs > 0,
+                ErrorKind::Invalid,
+                "Unknown SSRC {}",
+                ssrc
+            );
             self.unknown_ssrcs -= 1;
             let ssrc_context = SsrcContext {
                 replay_window_head: 0,
@@ -802,28 +808,26 @@ where
 }
 
 fn hmac_hash_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
-    use crypto::mac::Mac;
-    let mut hmac = crypto::hmac::Hmac::new(crypto::sha1::Sha1::new(), key);
-    hmac.input(data);
-    Vec::from(hmac.result().code())
+    let mut hmac = hmac::Hmac::<sha1::Sha1>::new_varkey(key).expect("Correct Key Length");
+    hmac.update(data);
+    hmac.finalize().into_bytes().to_vec()
 }
 
 fn prf_n(master_key: &[u8], x: BigUint, n: usize) -> Vec<u8> {
     // https://tools.ietf.org/html/rfc3711#section-4.1.1
     let mut output = Vec::new();
-    let mut ctr = crypto::aes::ctr(
-        crypto::aes::KeySize::KeySize128,
-        master_key,
-        &(x << 16).to_bytes_be(),
-    );
+    let mut ctr = aes_ctr::Aes128Ctr::new_var(master_key, &(x << 16).to_bytes_be())
+        .expect("Correct Key Length");
+
+    output.reserve_exact(n.next_multiple_of(&16));
+
     for i in 0.. {
         let old_len = output.len();
-        let new_len = output.len() + 16;
-        output.resize(new_len, 0);
 
-        let mut input = [0; 16];
-        (&mut input[8..]).write_u64be(i).unwrap();
-        ctr.process(&input[..], &mut output[old_len..]);
+        output.extend_from_slice(&[0u8; 8]);
+        output.extend_from_slice(&u64::to_be_bytes(i));
+
+        ctr.apply_keystream(&mut output[old_len..]);
         if output.len() >= n {
             break;
         }

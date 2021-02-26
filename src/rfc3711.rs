@@ -470,11 +470,12 @@ where
         ssrc: u32,
         index: P::PacketIndex,
     ) {
-        let iv = BigUint::from_bytes_be(&context.session_salt_key) << 16;
-        let iv = iv ^ (BigUint::from(ssrc) << 64);
-        let iv = iv ^ (index.into() << 16);
-        let iv = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
-        let iv = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
+        let iv: BigUint = BigUint::from_bytes_be(&context.session_salt_key) << 16;
+        let iv: BigUint = iv ^ (BigUint::from(ssrc) << 64);
+        let index_biguint: BigUint = index.into();
+        let iv: BigUint = iv ^ (index_biguint << 16);
+        let iv: BigUint = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
+        let iv: &[u8] = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
 
         let mut ctr =
             aes_ctr::Aes128Ctr::new_var(&context.session_encr_key, iv).expect("Correct Key Length");
@@ -504,11 +505,12 @@ where
         ssrc: u32,
         index: P::PacketIndex,
     ) {
-        let iv = BigUint::from_bytes_be(&context.session_salt_key) << 16;
-        let iv = iv ^ (BigUint::from(ssrc) << 64);
-        let iv = iv ^ (index.into() << 16);
-        let iv = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
-        let iv = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
+        let iv: BigUint = BigUint::from_bytes_be(&context.session_salt_key) << 16;
+        let iv: BigUint = iv ^ (BigUint::from(ssrc) << 64);
+        let index_biguint: BigUint = index.into();
+        let iv: BigUint = iv ^ (index_biguint << 16);
+        let iv: BigUint = iv ^ (BigUint::from(1_u8) << (context.session_encr_key.len() * 8));
+        let iv: &[u8] = &iv.to_bytes_be()[1..context.session_encr_key.len() + 1];
 
         let mut ctr =
             aes_ctr::Aes128Ctr::new_var(&context.session_encr_key, iv).expect("Correct Key Length");
